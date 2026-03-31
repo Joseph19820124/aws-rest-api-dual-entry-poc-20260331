@@ -185,6 +185,22 @@ OperationNotPermitted: This AWS account currently does not support creating load
 - Deployment work directory: `/home/joseph_siyi/aws4-private-api-deploy`
 - Main script: `/home/joseph_siyi/aws4-private-api-deploy/deploy.sh`
 
+## Infrastructure as Code
+
+This repository now also includes a CloudFormation version of the POC:
+
+- `cloudformation/template.yaml`
+- `cloudformation/parameters.example.json`
+- `cloudformation/README.md`
+
+The template is parameterized and models the same logical design:
+
+- `execute-api` interface VPCE
+- shared `internal ALB + ECS Fargate`
+- `API Gateway VPC Link v2`
+- public `Regional REST API + WAF`
+- private `REST API` restricted to the VPCE
+
 ## Cleanup Targets
 
 If this POC needs to be removed later, the main resources to delete are:

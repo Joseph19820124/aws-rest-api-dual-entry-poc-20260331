@@ -1,0 +1,26 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "hello-private-api"
+  },
+  {
+    "ParameterKey": "VpcId",
+    "ParameterValue": "vpc-0d2570affb01999a6"
+  },
+  {
+    "ParameterKey": "VpcCidr",
+    "ParameterValue": "172.31.0.0/16"
+  },
+  {
+    "ParameterKey": "SubnetIds",
+    "ParameterValue": "subnet-07914d1141c60807d,subnet-0a8e30e98c75454f6,subnet-0d189e31c561a1543"
+  },
+  {
+    "ParameterKey": "ApiStagePublic",
+    "ParameterValue": "public"
+  },
+  {
+    "ParameterKey": "ApiStagePrivate",
+    "ParameterValue": "private"
+  }
+]

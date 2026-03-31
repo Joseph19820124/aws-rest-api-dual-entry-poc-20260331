@@ -1,0 +1,393 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  POC stack for dual REST API entry points on AWS. Creates a shared backend
+  (internal ALB + ECS Fargate), a VPC endpoint for execute-api, an API Gateway
+  VPC Link v2, a public Regional REST API protected by WAF, and a private REST
+  API restricted to a specific interface VPCE.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hello-private-api
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+    Description: CIDR block of the target VPC, used in security group rules.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  ContainerPort:
+    Type: Number
+    Default: 3000
+  DesiredCount:
+    Type: Number
+    Default: 1
+  ApiStagePublic:
+    Type: String
+    Default: public
+  ApiStagePrivate:
+    Type: String
+    Default: private
+  TaskCpu:
+    Type: String
+    Default: '256'
+  TaskMemory:
+    Type: String
+    Default: '512'
+  ContainerImage:
+    Type: String
+    Default: public.ecr.aws/docker/library/python:3.11-alpine
+  WafManagedRuleGroupName:
+    Type: String
+    Default: AWSManagedRulesCommonRuleSet
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow VPC traffic to internal ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb-sg
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ALB traffic to ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ecs-sg
+
+  VpceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow VPC traffic to execute-api interface VPCE
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpce-sg
+
+  ExecuteApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpceSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.execute-api
+      SubnetIds: !Ref SubnetIds
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}
+      RetentionInDays: 14
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ecs-task-exec-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-cluster
+
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-task
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref ContainerPort
+              Protocol: tcp
+          Command:
+            - python
+            - -c
+            - !Sub |
+                import json
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+                class H(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'message': 'hello world',
+                            'service': '${ProjectName}',
+                            'path': self.path
+                        }).encode())
+                    def log_message(self, fmt, *args):
+                        return
+                HTTPServer(('0.0.0.0', ${ContainerPort}), H).serve_forever()
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  InternalAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-alb
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets: !Ref SubnetIds
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /hello
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: '200'
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+      LoadBalancerArn: !Ref InternalAlb
+      Port: 80
+      Protocol: HTTP
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - AlbListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref AlbTargetGroup
+      ServiceName: !Sub ${ProjectName}-svc
+      TaskDefinition: !Ref AppTaskDefinition
+
+  ApiVpcLinkV2:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub ${ProjectName}-vpclink-v2
+      SecurityGroupIds:
+        - !Ref AlbSecurityGroup
+      SubnetIds: !Ref SubnetIds
+
+  PublicRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-public-rest-api
+      Description: Public Regional REST API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  PublicHelloResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt PublicRestApi.RootResourceId
+      PathPart: hello
+      RestApiId: !Ref PublicRestApi
+
+  PublicHelloMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref PublicHelloResource
+      RestApiId: !Ref PublicRestApi
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref ApiVpcLinkV2
+        Uri: !Sub http://${InternalAlb.DNSName}/hello
+        IntegrationTarget: !Ref InternalAlb
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+
+  PublicDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PublicHelloMethod
+    Properties:
+      RestApiId: !Ref PublicRestApi
+
+  PublicStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref PublicDeployment
+      RestApiId: !Ref PublicRestApi
+      StageName: !Ref ApiStagePublic
+
+  PublicWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      DefaultAction:
+        Allow: {}
+      Name: !Sub ${ProjectName}-public-rest-waf
+      Scope: REGIONAL
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${ProjectName}-public-rest-waf
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: !Sub AWS-${WafManagedRuleGroupName}
+          Priority: 0
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: !Ref WafManagedRuleGroupName
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Ref WafManagedRuleGroupName
+            SampledRequestsEnabled: true
+
+  PublicWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${PublicRestApi}/stages/${ApiStagePublic}
+      WebACLArn: !GetAtt PublicWebAcl.Arn
+
+  PrivateRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-private-rest-api
+      Description: Private REST API restricted to the execute-api VPCE
+      EndpointConfiguration:
+        Types:
+          - PRIVATE
+        VpcEndpointIds:
+          - !Ref ExecuteApiVpcEndpoint
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+            Condition:
+              StringNotEquals:
+                aws:SourceVpce: !Ref ExecuteApiVpcEndpoint
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+
+  PrivateHelloResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt PrivateRestApi.RootResourceId
+      PathPart: hello
+      RestApiId: !Ref PrivateRestApi
+
+  PrivateHelloMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref PrivateHelloResource
+      RestApiId: !Ref PrivateRestApi
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref ApiVpcLinkV2
+        Uri: !Sub http://${InternalAlb.DNSName}/hello
+        IntegrationTarget: !Ref InternalAlb
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+
+  PrivateDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PrivateHelloMethod
+    Properties:
+      RestApiId: !Ref PrivateRestApi
+
+  PrivateStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref PrivateDeployment
+      RestApiId: !Ref PrivateRestApi
+      StageName: !Ref ApiStagePrivate
+
+Outputs:
+  PublicRestApiId:
+    Value: !Ref PublicRestApi
+  PublicInvokeUrl:
+    Value: !Sub https://${PublicRestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStagePublic}/hello
+  PrivateRestApiId:
+    Value: !Ref PrivateRestApi
+  PrivateInvokeUrl:
+    Value: !Sub https://${PrivateRestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStagePrivate}/hello
+  ExecuteApiVpcEndpointId:
+    Value: !Ref ExecuteApiVpcEndpoint
+  VpcLinkV2Id:
+    Value: !Ref ApiVpcLinkV2
+  WafArn:
+    Value: !GetAtt PublicWebAcl.Arn
+  AlbArn:
+    Value: !Ref InternalAlb
+  AlbDnsName:
+    Value: !GetAtt InternalAlb.DNSName
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  EcsServiceName:
+    Value: !GetAtt EcsService.Name
